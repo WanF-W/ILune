@@ -215,23 +215,28 @@ HANDLE Injector::CreateSharedMemory(DWORD pid, const wchar_t* pipeName)
 }
 
 
+// 初始化
+void* Injector::shareMemHandle = nullptr;
+
 // ============================================================
 // DLL 注入主函数
 // ============================================================
 bool Injector::Inject(DWORD pid, const std::wstring& dllPath, const wchar_t* pipeName)
 {
-    // 创建共享内存（传递管道名称给 DLL）
-    HANDLE hSharedMem = CreateSharedMemory(pid, pipeName);
+    // 创建并缓存共享内存句柄
+    // DLL 在其工作线程中会读取共享内存获取管道名称
+    // 收到 Hello 帧时释放
+    shareMemHandle = CreateSharedMemory(pid, pipeName);
 
     // 共享内存创建失败
-    if (hSharedMem == nullptr) return false;
+    if (shareMemHandle == nullptr) return false;
 
     // 打开目标进程
     HANDLE hProcess = OpenTargetProcess(pid);
     if (hProcess == nullptr)
     {
         // 清理共享内存
-        CloseHandle(hSharedMem);
+        CloseHandle(shareMemHandle);
         // 无法打开进程
         return false;
     }
@@ -250,7 +255,7 @@ bool Injector::Inject(DWORD pid, const std::wstring& dllPath, const wchar_t* pip
     {
         // 路径转换失败或路径过长
         CloseHandle(hProcess);
-        CloseHandle(hSharedMem);
+        CloseHandle(shareMemHandle);
         return false;
     }
 
@@ -259,7 +264,7 @@ bool Injector::Inject(DWORD pid, const std::wstring& dllPath, const wchar_t* pip
     {
         // DLL 文件不存在
         CloseHandle(hProcess);
-        CloseHandle(hSharedMem);
+        CloseHandle(shareMemHandle);
         return false;
     }
 
@@ -279,7 +284,7 @@ bool Injector::Inject(DWORD pid, const std::wstring& dllPath, const wchar_t* pip
     {
         // 内存分配失败
         CloseHandle(hProcess);
-        CloseHandle(hSharedMem);
+        CloseHandle(shareMemHandle);
         return false;
     }
 
@@ -297,7 +302,7 @@ bool Injector::Inject(DWORD pid, const std::wstring& dllPath, const wchar_t* pip
         // 写入失败
         VirtualFreeEx(hProcess, remoteMemory, 0, MEM_RELEASE);
         CloseHandle(hProcess);
-        CloseHandle(hSharedMem);
+        CloseHandle(shareMemHandle);
         return false;
     }
 
@@ -309,7 +314,7 @@ bool Injector::Inject(DWORD pid, const std::wstring& dllPath, const wchar_t* pip
     {
         VirtualFreeEx(hProcess, remoteMemory, 0, MEM_RELEASE);
         CloseHandle(hProcess);
-        CloseHandle(hSharedMem);
+        CloseHandle(shareMemHandle);
         return false;
     }
 
@@ -320,14 +325,13 @@ bool Injector::Inject(DWORD pid, const std::wstring& dllPath, const wchar_t* pip
     {
         VirtualFreeEx(hProcess, remoteMemory, 0, MEM_RELEASE);
         CloseHandle(hProcess);
-        CloseHandle(hSharedMem);
+        CloseHandle(shareMemHandle);
         return false;
     }
 
     // 创建远程线程执行 LoadLibraryW
     // CreateRemoteThread 在目标进程中创建一个新线程
     // 线程函数为 LoadLibraryW 参数为 DLL 路径地址
-
     HANDLE hThread = CreateRemoteThread(
         hProcess,                                                  // 目标进程句柄
         nullptr,                                                   // 默认安全属性
@@ -337,7 +341,7 @@ bool Injector::Inject(DWORD pid, const std::wstring& dllPath, const wchar_t* pip
         0,                                                         // 立即执行
         nullptr);                                                  // 不需要线程 ID
 
-    // ---- 如果 CreateRemoteThread 失败 尝试 NtCreateThreadEx ----
+    // 如果 CreateRemoteThread 失败 尝试 NtCreateThreadEx
     if (hThread == nullptr)
     {
         hThread = InjectViaNtCreateThreadEx(hProcess, loadLibraryAddr, remoteMemory);
@@ -348,7 +352,7 @@ bool Injector::Inject(DWORD pid, const std::wstring& dllPath, const wchar_t* pip
         // 两种注入方式都失败
         VirtualFreeEx(hProcess, remoteMemory, 0, MEM_RELEASE);
         CloseHandle(hProcess);
-        CloseHandle(hSharedMem);
+        CloseHandle(shareMemHandle);
         return false;
     }
 
@@ -371,15 +375,6 @@ bool Injector::Inject(DWORD pid, const std::wstring& dllPath, const wchar_t* pip
 
     // 关闭进程句柄
     CloseHandle(hProcess);
-
-    // 等待 DLL 读取共享内存
-    // DLL 在其工作线程中会读取共享内存获取管道名称
-    // 等待 3 秒确保 DLL 已完成读取
-    Sleep(protocol::FOR_DLLREADMEM_TIME);
-
-    // 关闭共享内存句柄
-    // 关闭后共享内存将被销毁（如果没有其他句柄打开）
-    CloseHandle(hSharedMem);
 
     // 检查注入是否成功（LoadLibraryW 返回值非零）
     return (waitResult == WAIT_OBJECT_0 && exitCode != 0);
@@ -423,4 +418,16 @@ HANDLE Injector::InjectViaNtCreateThreadEx(HANDLE hProcess, void* loadLibrary, v
 
     // 成功 返回线程句柄
     return hThread;
+}
+
+// ============================================================
+// 清理释放共享内存
+// ============================================================
+void Injector::CloseSharedMemory()
+{
+    if (shareMemHandle)
+    {
+        CloseHandle(shareMemHandle);
+        shareMemHandle = nullptr;
+    }
 }

@@ -88,6 +88,9 @@ public:
      */
     static bool Inject(DWORD pid, const std::wstring& dllPath, const wchar_t* pipeName);
 
+    // 释放共享内存
+    static void CloseSharedMemory();
+
 private:
     // 禁止实例化（纯静态工具类）
     Injector() = delete;
@@ -114,4 +117,7 @@ private:
      * @return 远程线程句柄 失败返回 nullptr
      */
     static HANDLE InjectViaNtCreateThreadEx(HANDLE hProcess, void* loadLibrary, void* param);
+
+    // 共享内存句柄
+    static HANDLE shareMemHandle;
 };

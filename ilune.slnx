@@ -3,5 +3,5 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="ilune.vcxproj" />
+  <Project Path="ilune.vcxproj" Id="cd401ee6-c1e8-4eed-8138-65cf55c6f558" />
 </Solution>

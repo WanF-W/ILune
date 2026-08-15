@@ -18,6 +18,17 @@
       <Platform>x64</Platform>
     </ProjectConfiguration>
   </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\common.h" />
+    <ClInclude Include="src\injector.h" />
+    <ClInclude Include="src\pipe_server.h" />
+    <ClInclude Include="src\protocol.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\ilune.cpp" />
+    <ClCompile Include="src\injector.cpp" />
+    <ClCompile Include="src\pipe_server.cpp" />
+  </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>18.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
@@ -140,17 +151,6 @@
       <EnableSegmentHeap>true</EnableSegmentHeap>
     </Manifest>
   </ItemDefinitionGroup>
-  <ItemGroup>
-    <ClInclude Include="src\common.h" />
-    <ClInclude Include="src\injector.h" />
-    <ClInclude Include="src\pipe_server.h" />
-    <ClInclude Include="src\protocol.h" />
-  </ItemGroup>
-  <ItemGroup>
-    <ClCompile Include="src\ilune.cpp" />
-    <ClCompile Include="src\injector.cpp" />
-    <ClCompile Include="src\pipe_server.cpp" />
-  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

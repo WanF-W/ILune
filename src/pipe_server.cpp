@@ -5,28 +5,97 @@
  * 本文件实现 pipe_server.h 中声明的 PipeServer 类
  *
  * 模块组成
- * 
+ *
+ * ·重叠 I/O 辅助（ReadPipeOverlapped / WritePipeOverlapped）
  * ·生命周期管理（Start / Stop / 析构）
  * ·客户端连接等待（WaitForClient）
- * ·帧发送（SendFrame）
- * ·帧接收（RecvFrame — 基于 PeekNamedPipe 轮询）
+ * ·后台读取线程（ReaderLoop — 持续读管道并分发帧）
+ * ·帧发送（SendFrame — 重叠 I/O 写）
+ * ·帧接收（RecvFrame — 基于响应帧队列）
  * ·等待特定帧类型（WaitForFrame）
  *
- * 线程模型（单线程）
- * 
- * ·主线程负责所有操作：创建管道、等待连接、发送命令、接收响应
- * ·不使用后台读取线程 避免 ReadFile 阻塞管道句柄导致 WriteFile 死锁
+ * 线程模型
  *
- * 超时实现
- * 
- * ·RecvFrame 使用 PeekNamedPipe 检测管道中是否有数据可读
- * ·如果没有数据 Sleep(10) 后重试 累计等待时间达到 timeoutMs 则返回 false
- * ·如果有数据（至少 HEADER_SIZE 字节） 调用 ReadFrame 读取完整帧
- * ·ReadFrame 内部的 ReadFile 会立即返回（因为数据已就绪）
+ * ·主线程: REPL / 命令收发（SendFrame + RecvFrame 队列）
+ * ·后台读取线程: 持续 ReadFile 管道 日志帧实时打印 响应帧入队
+ * ·句柄以 FILE_FLAG_OVERLAPPED 打开 挂起的读不阻塞主线程的写
  * ============================================================
  */
 
 #include "pipe_server.h"
+
+
+// ============================================================
+// 重叠 I/O 辅助
+// ============================================================
+
+// 重叠 I/O 读取（阻塞等待完成）
+// 返回 false 表示管道断开或读取失败
+static bool ReadPipeOverlapped(HANDLE pipe, void* buf, DWORD len, DWORD& bytesRead)
+{
+    OVERLAPPED ov{};
+    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (ov.hEvent == nullptr) return false;
+
+    BOOL ok = ReadFile(pipe, buf, len, &bytesRead, &ov);
+    if (!ok)
+    {
+        // 读取尚未完成 等待事件后取结果
+        if (GetLastError() == ERROR_IO_PENDING)
+        {
+            if (WaitForSingleObject(ov.hEvent, INFINITE) == WAIT_OBJECT_0)
+            {
+                ok = GetOverlappedResult(pipe, &ov, &bytesRead, FALSE);
+            }
+            else
+            {
+                ok = FALSE;
+            }
+        }
+        else
+        {
+            // 管道断开等错误
+            ok = FALSE;
+        }
+    }
+
+    CloseHandle(ov.hEvent);
+    return ok != FALSE;
+}
+
+// 重叠 I/O 写入（阻塞等待完成）
+// 返回 false 表示写入失败或未写满
+static bool WritePipeOverlapped(HANDLE pipe, const void* buf, DWORD len)
+{
+    OVERLAPPED ov{};
+    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (ov.hEvent == nullptr) return false;
+
+    DWORD written = 0;
+    BOOL ok = WriteFile(pipe, buf, len, &written, &ov);
+    if (!ok)
+    {
+        // 写入尚未完成 等待事件后取结果
+        if (GetLastError() == ERROR_IO_PENDING)
+        {
+            if (WaitForSingleObject(ov.hEvent, INFINITE) == WAIT_OBJECT_0)
+            {
+                ok = GetOverlappedResult(pipe, &ov, &written, FALSE);
+            }
+            else
+            {
+                ok = FALSE;
+            }
+        }
+        else
+        {
+            ok = FALSE;
+        }
+    }
+
+    CloseHandle(ov.hEvent);
+    return ok != FALSE && written == len;
+}
 
 
 // ============================================================
@@ -45,28 +114,51 @@ struct ConnectContext
 // ============================================================
 // 在独立线程中调用 ConnectNamedPipe（阻塞等待客户端连接）
 // 这个线程只用于连接阶段 连接完成后即退出 不影响后续 I/O
+// 句柄以 FILE_FLAG_OVERLAPPED 打开 必须提供 OVERLAPPED 结构
 static DWORD WINAPI ConnectWorkerProc(LPVOID lpParam)
 {
     // 获取上下文
     ConnectContext* ctx = static_cast<ConnectContext*>(lpParam);
 
-    // 调用 ConnectNamedPipe 等待客户端连接
-    // 此函数会阻塞 直到有客户端连接或出错
-    BOOL ok = ConnectNamedPipe(ctx->pipe, nullptr);
+    // 创建事件并调用重叠 ConnectNamedPipe
+    OVERLAPPED ov{};
+    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (ov.hEvent == nullptr)
+    {
+        ctx->success = false;
+        return 0;
+    }
 
+    BOOL ok = ConnectNamedPipe(ctx->pipe, &ov);
     if (!ok)
     {
-        // ConnectNamedPipe 返回 FALSE
-        // 检查是否是因为客户端在调用前已连接（这也是成功情况）
         DWORD err = GetLastError();
-        ctx->success = (err == ERROR_PIPE_CONNECTED);
-    }
-    else
-    {
-        // ConnectNamedPipe 返回 TRUE 客户端已连接
-        ctx->success = true;
+        if (err == ERROR_IO_PENDING)
+        {
+            // 等待连接完成
+            if (WaitForSingleObject(ov.hEvent, INFINITE) == WAIT_OBJECT_0)
+            {
+                DWORD dummy = 0;
+                ok = GetOverlappedResult(ctx->pipe, &ov, &dummy, FALSE);
+            }
+            else
+            {
+                ok = FALSE;
+            }
+        }
+        else if (err == ERROR_PIPE_CONNECTED)
+        {
+            // 客户端在调用前已连接 这也是成功情况
+            ok = TRUE;
+        }
+        else
+        {
+            ok = FALSE;
+        }
     }
 
+    CloseHandle(ov.hEvent);
+    ctx->success = (ok != FALSE);
     return 0;
 }
 
@@ -95,18 +187,21 @@ bool PipeServer::Start(const wchar_t* pipeName)
 
     // 创建命名管道
     // PIPE_ACCESS_DUPLEX: 双向管道（可读可写）
+    // FILE_FLAG_OVERLAPPED: 重叠模式
+    //   后台读取线程的挂起读不会阻塞主线程的写
     m_pipe = CreateNamedPipeW(
-        pipeName,                   // 管道名称
-        PIPE_ACCESS_DUPLEX,         // 双向访问模式
-        PIPE_TYPE_BYTE |            // 字节模式传输
-        PIPE_READMODE_BYTE |        // 字节模式读取
-        PIPE_WAIT |                 // 阻塞模式
-        PIPE_REJECT_REMOTE_CLIENTS, // 拒绝远程连接（安全）
-        1,                          // 最大实例数（单实例）
-        65536,                      // 输出缓冲区（64KB EXE→DLL 方向）
-        65536,                      // 输入缓冲区（64KB DLL→EXE 方向）
-        0,                          // 默认超时
-        nullptr);                   // 默认安全属性
+        pipeName,                       // 管道名称
+        PIPE_ACCESS_DUPLEX |
+        FILE_FLAG_OVERLAPPED,           // 双向 + 重叠模式
+        PIPE_TYPE_BYTE |                // 字节模式传输
+        PIPE_READMODE_BYTE |            // 字节模式读取
+        PIPE_WAIT |                     // 阻塞模式
+        PIPE_REJECT_REMOTE_CLIENTS,     // 拒绝远程连接（安全）
+        1,                              // 最大实例数（单实例）
+        65536,                          // 输出缓冲区（64KB EXE→DLL 方向）
+        65536,                          // 输入缓冲区（64KB DLL→EXE 方向）
+        0,                              // 默认超时
+        nullptr);                       // 默认安全属性
 
     // 检查创建结果
     if (m_pipe == INVALID_HANDLE_VALUE) return false;
@@ -119,6 +214,94 @@ bool PipeServer::Start(const wchar_t* pipeName)
 
 
 // ============================================================
+// 后台读取线程主循环
+// ============================================================
+// 持续从管道读取完整帧:
+// ·MSG_LOG（Lua print / hook 回调输出）→ 通过日志回调实时打印
+// ·其余帧（OK / ERROR / EXIT）→ 入队供 RecvFrame 消费
+// 管道断开或 Stop 关闭句柄时退出
+void PipeServer::ReaderLoop()
+{
+    while (!m_stopFlag)
+    {
+        // ---- 读取帧头: 1 字节类型 + 4 字节长度（小端）----
+        uint8_t header[protocol::HEADER_SIZE]{};
+        DWORD total = 0;
+        bool ok = true;
+
+        while (total < protocol::HEADER_SIZE)
+        {
+            DWORD chunk = 0;
+            if (!ReadPipeOverlapped(m_pipe, header + total,
+                    static_cast<DWORD>(protocol::HEADER_SIZE) - total, chunk) || chunk == 0)
+            {
+                ok = false;
+                break;
+            }
+            total += chunk;
+        }
+        if (!ok) break;
+
+        // 解析帧头
+        uint8_t type = header[0];
+        uint32_t len = static_cast<uint32_t>(header[1])
+                     | (static_cast<uint32_t>(header[2]) << 8)
+                     | (static_cast<uint32_t>(header[3]) << 16)
+                     | (static_cast<uint32_t>(header[4]) << 24);
+
+        // 长度校验：防止恶意/损坏的帧头导致缓冲区溢出
+        if (len > protocol::MAX_PAYLOAD) break;
+
+        // ---- 读取负载 ----
+        std::vector<uint8_t> payload;
+        if (len > 0)
+        {
+            payload.resize(len);
+            total = 0;
+            while (total < len)
+            {
+                DWORD chunk = 0;
+                if (!ReadPipeOverlapped(m_pipe, payload.data() + total, len - total, chunk) || chunk == 0)
+                {
+                    ok = false;
+                    break;
+                }
+                total += chunk;
+            }
+            if (!ok) break;
+        }
+
+        // ---- 分发帧 ----
+        if (type == protocol::MSG_LOG)
+        {
+            // 日志帧: 实时输出 不进入响应队列
+            if (m_logCallback)
+            {
+                std::string text(payload.begin(), payload.end());
+                m_logCallback(text.c_str());
+            }
+        }
+        else
+        {
+            // 响应帧: 入队供 RecvFrame 消费
+            Frame f;
+            f.type = type;
+            f.payload = std::move(payload);
+            {
+                std::lock_guard<std::mutex> lk(m_queueMutex);
+                m_frameQueue.push_back(std::move(f));
+            }
+            m_queueCv.notify_one();
+        }
+    }
+
+    // 读取线程结束（管道断开或被 Stop 关闭）
+    m_connected = false;
+    m_queueCv.notify_all();
+}
+
+
+// ============================================================
 // 停止服务器
 // ============================================================
 void PipeServer::Stop()
@@ -126,13 +309,29 @@ void PipeServer::Stop()
     // 设置停止标志
     m_stopFlag = true;
 
+    // 加锁确保没有其他线程正在写入
+    std::lock_guard<std::mutex> lock(m_writeMutex);
+
     // 关闭管道句柄
-    // 关闭句柄会使任何阻塞的管道操作立即失败返回
+    // 关闭句柄会使后台读取线程的挂起读立即失败 线程随后退出
     if (m_pipe != INVALID_HANDLE_VALUE)
     {
         CloseHandle(m_pipe);
         m_pipe = INVALID_HANDLE_VALUE;
     }
+
+    // 等待后台读取线程退出
+    if (m_readerThread.joinable())
+    {
+        m_readerThread.join();
+    }
+
+    // 清空响应队列
+    {
+        std::lock_guard<std::mutex> qk(m_queueMutex);
+        m_frameQueue.clear();
+    }
+    m_queueCv.notify_all();
 
     // 重置状态
     m_connected = false;
@@ -155,7 +354,6 @@ bool PipeServer::WaitForClient(int timeoutMs)
     // 在工作线程中调用 ConnectNamedPipe
     // ConnectNamedPipe 是阻塞的 需要放在单独线程中
     // 主线程通过 WaitForSingleObject 实现超时控制
-    // 注意：这个工作线程在连接完成后立即退出 不会影响后续管道 I/O
     HANDLE hConnectThread = CreateThread(
         nullptr,                // 默认安全属性
         0,                      // 默认栈大小
@@ -192,10 +390,13 @@ bool PipeServer::WaitForClient(int timeoutMs)
     if (!ctx.success) return false;
 
     // 连接成功
-    // 不需要启动读取线程 直接标记为已连接
-    // 后续 SendFrame 和 RecvFrame 都在主线程中同步执行
     m_connected = true;
     m_stopFlag  = false;
+
+    // 启动后台读取线程
+    // 句柄已用 FILE_FLAG_OVERLAPPED 打开 挂起的读不会阻塞主线程的写
+    // 该线程持续读取 DLL 发来的帧: 日志帧实时打印 响应帧入队
+    m_readerThread = std::thread([this] { ReaderLoop(); });
 
     return true;
 }
@@ -213,129 +414,62 @@ bool PipeServer::SendFrame(uint8_t type, const void* data, uint32_t len)
     // 虽然当前只有主线程调用 但 Ctrl+C 处理函数可能从另一个线程调用 SendFrame
     std::lock_guard<std::mutex> lock(m_writeMutex);
 
-    // 调用协议层写入帧
-    return protocol::WriteFrame(m_pipe, type, data, len);
+    // 构造帧头: 1 字节类型 + 4 字节长度（小端）
+    uint8_t header[protocol::HEADER_SIZE]{};
+    header[0] = type;
+    header[1] = static_cast<uint8_t>(len & 0xFF);
+    header[2] = static_cast<uint8_t>((len >> 8) & 0xFF);
+    header[3] = static_cast<uint8_t>((len >> 16) & 0xFF);
+    header[4] = static_cast<uint8_t>((len >> 24) & 0xFF);
+
+    // 重叠 I/O 写（后台读取线程的挂起读不会阻塞本写入）
+    if (!WritePipeOverlapped(m_pipe, header, protocol::HEADER_SIZE)) return false;
+
+    // 写负载
+    if (len > 0 && data != nullptr)
+    {
+        if (!WritePipeOverlapped(m_pipe, data, len)) return false;
+    }
+    return true;
 }
 
 
 // ============================================================
-// 帧接收（基于 PeekNamedPipe 轮询 带超时）
+// 帧接收（基于响应帧队列 带超时）
 // ============================================================
-// 这是修复管道死锁的关键函数
-//
-// 旧实现使用后台读取线程持续 ReadFile 导致管道句柄被阻塞的 ReadFile 占用 
-// 主线程的 WriteFile 无法执行（Windows 命名管道在阻塞模式下序列化 I/O）
-//
-// 新实现使用 PeekNamedPipe 非阻塞检测数据可用性
-// 
-// ·PeekNamedPipe 查询管道中有多少字节可读（不会阻塞）
-// ·如果可读字节数 >= HEADER_SIZE 调用 ReadFrame 读取完整帧
-// ·ReadFrame 内部的 ReadFile 会立即返回（因为数据已就绪）
-// ·如果没有数据 Sleep(10) 后重试 累计等待达到 timeoutMs 则超时
-//
-// 这样管道句柄不会被长时间占用 SendFrame 中的 WriteFile 可以随时执行
+// 后台读取线程把 OK / ERROR / EXIT 等响应帧放入队列
+// 本函数在队列上等待（condition_variable + 超时）并取出一个帧
+// 日志帧不进入队列 由日志回调直接输出
 bool PipeServer::RecvFrame(Frame& out, int timeoutMs)
 {
-    // 前置检查
-    if (!m_connected || m_pipe == INVALID_HANDLE_VALUE) return false;
+    std::unique_lock<std::mutex> lk(m_queueMutex);
 
-    // 记录开始时间（用于计算已等待时间）
-    auto startTime = std::chrono::steady_clock::now();
+    // 等待条件: 队列非空 或 管道断开/停止
+    auto ready = [this] { return !m_frameQueue.empty() || !m_connected || m_stopFlag; };
 
-    // 轮询循环
-    while (!m_stopFlag)
+    if (timeoutMs < 0)
     {
-        // 使用 PeekNamedPipe 检测管道中的可读数据量
-        // PeekNamedPipe 是非阻塞的 立即返回管道中可读的字节数
-        // 它不会将数据从管道中移除 只是"偷看"
-        DWORD bytesAvailable = 0;
-        BOOL peekOk = PeekNamedPipe(
-            m_pipe,             // 管道句柄
-            nullptr,            // 不复制数据到缓冲区
-            0,                  // 不读取任何字节
-            nullptr,            // 不接收已读字节数
-            &bytesAvailable,    // [out] 管道中可读的总字节数
-            nullptr);           // 不接收剩余字节数
-
-        // PeekNamedPipe 失败 — 管道已断开或出错
-        if (!peekOk)
-        {        
-            m_connected = false;
-            return false;
-        }
-
-        // 检查是否有足够数据读取帧头
-        // 帧头为 5 字节（1 字节类型 + 4 字节长度）
-        // 只有当可读字节数 >= HEADER_SIZE 时才尝试读取
-        if (bytesAvailable >= protocol::HEADER_SIZE)
-        {
-            // 数据已就绪 调用 ReadFrame 读取完整帧
-            // 由于 PeekNamedPipe 确认了至少有 HEADER_SIZE 字节可读 
-            // ReadFrame 中读取帧头的 ReadFile 会立即返回
-            // 读取帧头后 可能还需要读取负载,负载数据通常紧随帧头到达 
-            // ReadFrame 内部会循环 ReadFile 直到读完全部负载
-            uint8_t  type = 0;
-            uint8_t* data = nullptr;
-            uint32_t len  = 0;
-
-            // ReadFrame 失败 — 管道已断开或数据损坏
-            if (!protocol::ReadFrame(m_pipe, type, data, len))
-            {
-                m_connected = false;
-                return false;
-            }
-
-            // 构造帧对象
-            out.type = type;
-
-            // 深拷贝负载数据
-            // ReadFrame 使用内部静态缓冲区 下次调用会覆盖 必须立即复制
-            if (len > 0 && data != nullptr)
-            {
-                out.payload.assign(data, data + len);
-            }
-            else
-            {
-                out.payload.clear();
-            }
-
-            // 成功读取一帧
-            return true;
-        }
-
-        // ---- 没有足够数据 根据超时策略处理 ----
-        if (timeoutMs == 0)
-        {
-            // 非阻塞模式：立即返回
-            return false;
-        }
-
-        if (timeoutMs > 0)
-        {
-            // 带超时模式：检查是否已超时
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startTime).count();
-
-            // 超时
-            if (elapsed >= timeoutMs) return false;
-
-            // 还有剩余时间 短暂休眠后重试
-            // 休眠时间取剩余时间和 10ms 的较小值
-            int remaining = timeoutMs - static_cast<int>(elapsed);
-            DWORD sleepMs = (remaining < 10) ? remaining : 10;
-            Sleep(sleepMs);
-        }
-        else
-        {
-            // 无限等待模式（timeoutMs < 0）
-            // 短暂休眠后重试 避免 CPU 空转
-            Sleep(10);
-        }
+        // 无限等待
+        m_queueCv.wait(lk, ready);
+    }
+    else if (timeoutMs == 0)
+    {
+        // 非阻塞模式：立即返回
+        if (!ready()) return false;
+    }
+    else
+    {
+        // 带超时模式
+        m_queueCv.wait_for(lk, std::chrono::milliseconds(timeoutMs), ready);
     }
 
-    // 停止标志被设置
-    m_connected = false;
+    // 队列为空: 超时或管道断开
+    if (m_frameQueue.empty()) return false;
 
-    return false;
+    // 取出一个帧
+    out = std::move(m_frameQueue.front());
+    m_frameQueue.pop_front();
+    return true;
 }
 
 

@@ -4,18 +4,19 @@
  * ============================================================
  * 定义注入器（ilune.exe）与游戏内 DLL 之间的通信协议
  *
- * 帧格式：[1字节类型][4字节长度LE][N字节负载]
- * 
+ * 帧格式
+ *
+ * [1字节类型][4字节长度LE][N字节负载]
  * ·类型：见 MessageType 枚举
  * ·长度：小端 32 位无符号 最大 1MB
  * ·负载：任意二进制数据
  *
- * 通信流程：
+ * 通信流程
  * 
  * ·EXE 创建命名管道服务器
  * ·EXE 注入 DLL（通过共享内存传递管道名）
- * ·DLL 连接管道，发送 HELLO（版本握手）
- * ·DLL 初始化 IL2CPP + Lua，发送 READY
+ * ·DLL 连接管道 发送 HELLO（版本握手）
+ * ·DLL 初始化 IL2CPP + Lua 发送 READY
  * ·EXE 可选发送 CMD（执行 Lua 代码）或 FILE（执行 Lua 文件）
  * ·DLL 执行后回送 OK / ERROR / LOG
  * ·任一方发送 EXIT 结束通信
@@ -27,7 +28,6 @@
 #include "common.h"
 #include <windows.h>
 
-
 namespace protocol
 {
     // ============================================================
@@ -36,7 +36,7 @@ namespace protocol
     enum MessageType : uint8_t
     {
         // DLL → EXE
-        MSG_HELLO = 0x10,   // 握手：负载为版本字符串 "Il2CppLua/1.0.0"
+        MSG_HELLO = 0x10,   // 握手：负载为版本字符串 "Il2CppLua/2.0.0"
         MSG_READY = 0x11,   // 初始化就绪：负载为状态描述文本
         MSG_LOG   = 0x20,   // Lua print 输出：负载为输出文本
         MSG_ERROR = 0x21,   // 错误信息：负载为错误描述
@@ -85,19 +85,22 @@ namespace protocol
     // 文件执行超时：60 秒
     constexpr int LUAFILE_TIMEOUT = 60000;
 
-    // 版本标识（HELLO 帧的负载内容）
-    constexpr const char* VERSION = "Il2CppLua/1.0.0";
+    // 管道忙超时 等待服务器管道 ConnectNamedPipe
+    constexpr DWORD WAITSERVER_BUSY = 5000;
 
-    // 共享内存名称前缀：注入器创建共享内存写入管道名，
-    // DLL 加载后读取。完整名称 = 前缀 + 目标进程 PID
+    // 版本标识（HELLO 帧的负载内容）
+    constexpr const char* VERSION = "Il2CppLua/2.0.0";
+
+    // 共享内存名称前缀：注入器创建共享内存写入管道名 
+    // DLL 加载后读取 完整名称 = 前缀 + 目标进程 PID
     // 例如：Il2CppLua_Config_5454
     constexpr const wchar_t* SHARED_MEM_PREFIX = L"Il2CppLua_Config_";
 
-    // 命名管道名称前缀。完整名称 = 前缀 + 目标进程 PID
+    // 命名管道名称前缀 完整名称 = 前缀 + 目标进程 PID
     // 例如：\\.\pipe\Il2CppLua_5454
     constexpr const wchar_t* PIPE_PREFIX = L"\\\\.\\pipe\\Il2CppLua_";
 
-    // 共享内存最大大小（字节），足够容纳一个管道名称
+    // 共享内存最大大小（字节） 足够容纳一个管道名称
     constexpr size_t SHARED_MEM_SIZE = 512;
 
 
@@ -149,19 +152,19 @@ namespace protocol
     /**
      * 从管道读取一个完整的帧
      *
-     * 使用内部静态缓冲区，返回的 data 指针在下次调用时会被覆盖
+     * 使用内部静态缓冲区 返回的 data 指针在下次调用时会被覆盖
      * 调用者应在调用下一次 ReadFrame 前处理完数据
      *
      * @param pipe   管道句柄
      * @param type   [out] 接收消息类型
      * @param data   [out] 接收负载数据指针（指向内部静态缓冲区）
      * @param len    [out] 接收负载长度
-     * @return true 读取成功，false 失败（管道断开等）
+     * @return true 读取成功 false 失败（管道断开等）
      */
     inline bool ReadFrame(HANDLE pipe, uint8_t& type, uint8_t*& data, uint32_t& len)
     {
         // 静态缓冲区：避免每次调用都分配内存
-        // 大小 = 最大负载 + 帧头 + 1（末尾零终止符，方便当字符串用）
+        // 大小 = 最大负载 + 帧头 + 1（末尾零终止符 方便当字符串用）
         // 注意：需要 MAX_PAYLOAD + 1 字节来容纳 s_buffer[len] = 0 当 len == MAX_PAYLOAD 时
         static uint8_t s_buffer[MAX_PAYLOAD + 1];
 
@@ -178,7 +181,7 @@ namespace protocol
             totalRead += chunk;
         }
 
-        // 解析帧头（此时 totalRead == HEADER_SIZE，header 已完整填充）
+        // 解析帧头（此时 totalRead == HEADER_SIZE header 已完整填充）
         type = header[0];
         len  = static_cast<uint32_t>(header[1])
              | (static_cast<uint32_t>(header[2]) << 8)
@@ -199,8 +202,8 @@ namespace protocol
                 if (!ReadFile(pipe, &s_buffer[totalRead], remaining, &chunk, nullptr) || chunk == 0) return false;
                 totalRead += chunk;
             }
-            // 末尾放零终止符，方便调用方当字符串处理
-            // s_buffer 大小为 MAX_PAYLOAD + 1，len <= MAX_PAYLOAD，因此 s_buffer[len] 不越界
+            // 末尾放零终止符 方便调用方当字符串处理
+            // s_buffer 大小为 MAX_PAYLOAD + 1 len <= MAX_PAYLOAD 因此 s_buffer[len] 不越界
             s_buffer[len] = 0;
         }
 

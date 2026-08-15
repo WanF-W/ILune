@@ -1,6 +1,6 @@
 /**
  * ============================================================
- * ilune.cpp — Il2CppLua v1.0.0 注入器主程序
+ * ilune.cpp — Il2CppLua v2.0.0 注入器主程序
  * ============================================================
  * 本文件是 ilune.exe 的主入口 负责
  * 
@@ -164,7 +164,7 @@ static void PrintBanner()
     color::Cyan();
     std::wcout << L"===============================================================\n";
     color::Yellow();
-    std::wcout << L"\nILune For Il2CppLua v1.0.0\n";
+    std::wcout << L"\nILune For Il2CppLua v2.0.0\n";
     std::wcout << L"  - A Native C++ Bridge For Lua Interaction With Il2Cpp\n\n";
     color::Cyan();
     std::wcout << L"===============================================================\n\n";
@@ -566,6 +566,24 @@ static bool ExecuteCommand(PipeServer& server, const std::string& code, int time
     }
 }
 
+// ============================================================
+// REPL 辅助：打印提示符
+// ============================================================
+// 标记当前是否正停留在提示符行（光标在 "ilune >> " 之后）
+// 供后台读取线程的日志回调判断是否需要先换行/恢复提示符
+static std::atomic<bool> g_promptActive{ false };
+
+static void PrintPrompt()
+{
+    g_promptActive = true;
+    color::Yellow();
+    std::wcout << L"ilune >> ";
+    color::Reset();
+
+    // 刷新缓冲区
+    std::wcout.flush();
+}
+
 
 // ============================================================
 // 主入口
@@ -644,6 +662,40 @@ int wmain(int argc, wchar_t* argv[])
         return 1;
     }
 
+    // 注册日志回调: DLL 发来的 MSG_LOG（Lua print / hook 回调输出）
+    // 由 PipeServer 的后台读取线程实时打印 无需等待用户输入命令
+    server.SetLogCallback([](const char* text) {
+        if (text == nullptr) return;
+
+        // 光标还停留在提示符行时 先换行 让异步输出独占一行
+        // 避免输出直接粘连在 "ilune >> " 后面
+        if (g_promptActive)
+        {
+            std::wcout << L"\n";
+        }
+
+        // 与普通输出一致 直接打印
+        SafePrintUtf8(text);
+
+        // 文本末尾无换行时补一个 避免与后续提示符混在同一行
+        size_t len = strlen(text);
+        if (len == 0 || text[len - 1] != '\n')
+        {
+            std::wcout << L"\n";
+        }
+
+        // 与普通输出一致加个换行与下一个ilune >> 分离开
+        std::wcout << L"\n";
+
+        // 异步输出后恢复提示符 保证光标回到可输入状态
+        if (g_promptActive)
+        {
+            PrintPrompt();
+        }
+
+        std::wcout.flush();
+    });
+
     // ========================================================
     // 注入 DLL
     // ========================================================
@@ -719,6 +771,9 @@ int wmain(int argc, wchar_t* argv[])
     SafePrintUtf8("[+] Handshake: " + hello + "\n");
     color::Reset();
 
+    // 收到 Hello 帧 共享内存可释放
+    Injector::CloseSharedMemory();
+
     // 等待 READY 帧
     if (!server.WaitForFrame(protocol::MSG_READY, frame, protocol::DLLSAYREADY_TIMEOUT))
     {
@@ -785,46 +840,10 @@ int wmain(int argc, wchar_t* argv[])
     color::Reset();
 
     std::wcout << L"Welcome!\n\n";
-
     while (true)
     {
-        // drain 异步消息
-        // 主线程调度器在 Unity 主线程上执行 il2cpp.schedule(fn) 的函数 
-        // 其输出通过 MSG_LOG 帧发送到管道但此时 EXE 可能正阻塞在
-        // SafeReadUtf8 等待用户输入 这些帧会堆积在管道缓冲区中
-        // 在每次显示提示符前 先 drain 管道中的积压消息并打印
-        {
-            PipeServer::Frame asyncFrame;
-
-            bool hadAsync = false;
-
-            while (server.PollFrame(asyncFrame))
-            {
-                if (asyncFrame.type == protocol::MSG_LOG)
-                {
-                    if (!hadAsync)
-                    {
-                        // 第一条异步消息前换行 避免与上一条输出混在一起
-                        std::wcout << L"\n[async] ";
-                        hadAsync = true;
-                    }
-
-                    std::string text(asyncFrame.payload.begin(), asyncFrame.payload.end());
-
-                    SafePrintUtf8(text);
-                }
-            }
-
-            if (hadAsync) std::wcout << L"\n";
-        }
-
         // 打印提示符
-        color::Yellow();
-        std::wcout << L"ilune >> ";
-        color::Reset();
-
-        // 刷新缓冲区
-        std::wcout.flush();
+        PrintPrompt();
 
         // 读取用户输入
         // 使用 ReadConsoleW 直接读取 绕过 std::wcin 的编码问题
@@ -836,6 +855,9 @@ int wmain(int argc, wchar_t* argv[])
             std::wcout << L"\n";
             break;
         }
+
+        // 用户已按回车 光标离开提示符行 后续异步输出不再换行/恢复提示符
+        g_promptActive = false;
 
         // 跳过空输入
         if (input.empty() || input.find_first_not_of(" \t\r\n") == std::string::npos) continue;
@@ -862,7 +884,7 @@ int wmain(int argc, wchar_t* argv[])
         if (IsStatement(input)) codeToSend = input;
         else codeToSend = "return " + input;
 
-        //  执行命令
+        // 执行命令
         if (!ExecuteCommand(server, codeToSend))
         {
             // 执行失败或连接断开 检查是否是连接断开 如果只是执行错误 继续 REPL
@@ -894,6 +916,9 @@ int wmain(int argc, wchar_t* argv[])
     color::Reset();
 
     std::wcout << L"Thanks for using ilune!\n\n";
+
+    // 保底清除共享内存
+    Injector::CloseSharedMemory();
 
     return 0;
 }
