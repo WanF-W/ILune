@@ -1,6 +1,6 @@
 /**
  * ============================================================
- * ilune.cpp — Il2CppLua v2.0.0 注入器主程序
+ * ilune.cpp — Il2CppLua v2.1.0 注入器主程序
  * ============================================================
  * 本文件是 ilune.exe 的主入口 负责
  * 
@@ -164,7 +164,7 @@ static void PrintBanner()
     color::Cyan();
     std::wcout << L"===============================================================\n";
     color::Yellow();
-    std::wcout << L"\nILune For Il2CppLua v2.0.0\n";
+    std::wcout << L"\nILune For Il2CppLua v2.1.0\n";
     std::wcout << L"  - A Native C++ Bridge For Lua Interaction With Il2Cpp\n\n";
     color::Cyan();
     std::wcout << L"===============================================================\n\n";
@@ -573,8 +573,19 @@ static bool ExecuteCommand(PipeServer& server, const std::string& code, int time
 // 供后台读取线程的日志回调判断是否需要先换行/恢复提示符
 static std::atomic<bool> g_promptActive{ false };
 
+// 下一个提示符前是否需要补一个换行（与上一条输出/回车隔开一行）
+// 首次提示符与空输入回车不置位 其余命令执行与异步输出后都会置位
+static std::atomic<bool> g_promptSeparate{ false };
+
 static void PrintPrompt()
 {
+    // 除首次提示符与空输入回车外 每个提示符前补一个换行
+    // 保证与上一条内容（或玩家的回车）之间恰好空一行
+    if (g_promptSeparate.exchange(false))
+    {
+        std::wcout << L"\n";
+    }
+
     g_promptActive = true;
     color::Yellow();
     std::wcout << L"ilune >> ";
@@ -674,22 +685,21 @@ int wmain(int argc, wchar_t* argv[])
             std::wcout << L"\n";
         }
 
-        // 与普通输出一致 直接打印
+        // 统一输出：直接打印 末尾没有换行时补一个 保证内容独占完整行
         SafePrintUtf8(text);
 
-        // 文本末尾无换行时补一个 避免与后续提示符混在同一行
+        // 文本末尾无换行时补一个 只收尾不负责与提示符分隔
         size_t len = strlen(text);
         if (len == 0 || text[len - 1] != '\n')
         {
             std::wcout << L"\n";
         }
 
-        // 与普通输出一致加个换行与下一个ilune >> 分离开
-        std::wcout << L"\n";
-
         // 异步输出后恢复提示符 保证光标回到可输入状态
+        // 与下一个提示符的分隔由 PrintPrompt 统一补换行
         if (g_promptActive)
         {
+            g_promptSeparate = true;
             PrintPrompt();
         }
 
@@ -898,8 +908,8 @@ int wmain(int argc, wchar_t* argv[])
             }
         }
 
-        // 输出空行分隔
-        std::wcout << L"\n";
+        // 与下一个提示符隔开一行（由 PrintPrompt 统一补换行）
+        g_promptSeparate = true;
     }
 
     // ========================================================
